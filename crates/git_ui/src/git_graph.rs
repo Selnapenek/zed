@@ -1,5 +1,6 @@
 pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
 use crate::{
+    branch_picker,
     commit_context_menu::{
         CUSTOM_GIT_COMMANDS_DOCS_SLUG, CommitContextMenuData, CommitContextMenuSource,
         commit_context_menu, git_context_menu_tasks, git_task_context,
@@ -23,7 +24,7 @@ use gpui::{
     Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollEvent, ScrollHandle,
     ScrollStrategy, SharedString, Subscription, Task, TextRun, TextStyleRefinement,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
-    px, uniform_list,
+    px, relative, uniform_list,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement};
@@ -55,10 +56,11 @@ use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, DiffStat,
     Disclosure, Divider, HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem,
-    ListItemSpacing, RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
-    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
-    prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
-    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
+    ListItemSpacing, PopoverMenu, RedistributableColumnsState, ScrollableHandle, Table,
+    TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar,
+    bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
+    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
+    table_row::TableRow,
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
@@ -1484,6 +1486,29 @@ pub struct GitGraph {
     nav_history: Option<ItemNavHistory>,
 }
 
+fn toggled_branch_filter_source(source: &LogSource, branch: &git::repository::Branch) -> LogSource {
+    let mut branches = match source {
+        LogSource::Branch(current_branch) => vec![current_branch.clone()],
+        LogSource::Branches(branches) => branches.clone(),
+        _ => Vec::new(),
+    };
+    if let Some(index) = branches
+        .iter()
+        .position(|current_branch| branch_picker::branch_matches_ref(branch, current_branch))
+    {
+        branches.remove(index);
+    } else {
+        branches.push(branch.ref_name.clone());
+        branches.sort_unstable();
+    }
+
+    match branches.as_slice() {
+        [] => LogSource::All,
+        [branch] => LogSource::Branch(branch.clone()),
+        _ => LogSource::Branches(branches),
+    }
+}
+
 impl GitGraph {
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
         self.graph_data.clear();
@@ -1493,6 +1518,21 @@ impl GitGraph {
         self.context_menu = None;
         cx.emit(ItemEvent::Edit);
         cx.notify();
+    }
+
+    fn set_log_source(&mut self, source: LogSource, cx: &mut Context<Self>) {
+        if self.log_source == source {
+            return;
+        }
+        self.log_source = source;
+        self.selected_entry_idx = None;
+        self.pending_select_sha = None;
+        self.invalidate_state(cx);
+    }
+
+    fn toggle_branch_filter(&mut self, branch: &git::repository::Branch, cx: &mut Context<Self>) {
+        let source = toggled_branch_filter_source(&self.log_source, branch);
+        self.set_log_source(source, cx);
     }
 
     /// Computes the height of a single commit row in the git graph.
@@ -1552,9 +1592,7 @@ impl GitGraph {
             )
             .width;
 
-        label_width
-            .clamp(REF_LABEL_GUTTER_MIN_WIDTH, REF_LABEL_GUTTER_MAX_WIDTH)
-            .min(self.graph_viewport_width(window, cx) / 2.)
+        label_width.clamp(REF_LABEL_GUTTER_MIN_WIDTH, REF_LABEL_GUTTER_MAX_WIDTH)
     }
 
     /// Returns the column fractions in display order:
@@ -1606,16 +1644,6 @@ impl GitGraph {
         };
 
         ColumnWidthConfig::explicit(widths)
-    }
-
-    fn graph_viewport_width(&self, window: &Window, cx: &App) -> Pixels {
-        let container = self.column_widths.read(cx).cached_container_width();
-        let graph_fraction = self.preview_column_fractions(window, cx)[0];
-        if container > px(0.) && graph_fraction > 0.0 {
-            container * graph_fraction
-        } else {
-            self.graph_canvas_content_width()
-        }
     }
 
     pub fn new(
@@ -2862,8 +2890,83 @@ impl GitGraph {
         self.set_context_menu(context_menu, position, None, window, cx);
     }
 
+    fn render_branch_filter(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let repository = self.get_repository(cx);
+        let selected_branches = match &self.log_source {
+            LogSource::Branch(name) => vec![name.clone()],
+            LogSource::Branches(branches) => branches.clone(),
+            _ => Vec::new(),
+        };
+        let label: SharedString = match selected_branches.as_slice() {
+            [] => "All Branches".into(),
+            [branch] => branch
+                .strip_prefix("refs/heads/")
+                .or_else(|| branch.strip_prefix("refs/remotes/"))
+                .unwrap_or(branch)
+                .to_owned()
+                .into(),
+            branches => format!("{} Branches", branches.len()).into(),
+        };
+        let workspace = self.workspace.clone();
+        let git_graph = cx.entity();
+
+        h_flex()
+            .ml_auto()
+            .gap_1()
+            .child(
+                PopoverMenu::new("git-graph-branch-filter")
+                    .menu({
+                        let selected_branches = selected_branches.clone();
+                        move |window, cx| {
+                            let git_graph = git_graph.clone();
+                            let on_toggle: branch_picker::SelectBranchCallback = Arc::new(
+                                move |branch: git::repository::Branch,
+                                      _window: &mut Window,
+                                      cx: &mut App| {
+                                    git_graph.update(cx, |this, cx| {
+                                        this.toggle_branch_filter(&branch, cx);
+                                    });
+                                },
+                            );
+                            Some(branch_picker::select_multiple_popover(
+                                workspace.clone(),
+                                repository.clone(),
+                                selected_branches.clone(),
+                                on_toggle,
+                                window,
+                                cx,
+                            ))
+                        }
+                    })
+                    .trigger_with_tooltip(
+                        Button::new("git-graph-branch-filter-trigger", label).end_icon(
+                            Icon::new(IconName::ChevronDown)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                        Tooltip::text("Filter by Branch"),
+                    ),
+            )
+            .when(!selected_branches.is_empty(), |this| {
+                this.child(
+                    IconButton::new("git-graph-branch-filter-clear", IconName::Close)
+                        .shape(ui::IconButtonShape::Square)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Show All Branches"))
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.set_log_source(LogSource::All, cx);
+                        })),
+                )
+            })
+    }
+
     fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let color = cx.theme().colors();
+        let border_color = cx.theme().colors().border_variant;
+        let toolbar_background = cx.theme().colors().toolbar_background;
+        let show_branch_filter = matches!(
+            self.log_source,
+            LogSource::All | LogSource::Branch(_) | LogSource::Branches(_)
+        ) && self.get_repository(cx).is_some();
         let query_focus_handle = self
             .search_state
             .editor
@@ -2880,7 +2983,7 @@ impl GitGraph {
             .p_1p5()
             .gap_1p5()
             .border_b_1()
-            .border_color(color.border_variant)
+            .border_color(border_color)
             .child(
                 h_flex()
                     .h_8()
@@ -2890,9 +2993,9 @@ impl GitGraph {
                     .gap_1()
                     .track_focus(&query_focus_handle)
                     .border_1()
-                    .border_color(color.border_variant)
+                    .border_color(border_color)
                     .rounded_md()
-                    .bg(color.toolbar_background)
+                    .bg(toolbar_background)
                     .on_action(cx.listener(Self::confirm_search))
                     .child(self.search_state.editor.clone())
                     .child({
@@ -3003,6 +3106,9 @@ impl GitGraph {
                             ),
                     ),
             )
+            .when(show_branch_filter, |this| {
+                this.child(self.render_branch_filter(cx))
+            })
     }
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
@@ -3043,7 +3149,6 @@ impl GitGraph {
 
         let head_branch_name: Option<SharedString> = repository
             .read(cx)
-            .snapshot()
             .branch
             .as_ref()
             .map(|branch| SharedString::from(branch.name().to_string()));
@@ -3158,6 +3263,17 @@ impl GitGraph {
                     .child(
                         div().absolute().top_2().right_2().child(
                             IconButton::new("close-detail", IconName::Close)
+                                .tooltip({
+                                    let focus_handle = self.focus_handle.clone();
+                                    move |_window, cx: &mut App| {
+                                        Tooltip::for_action_in(
+                                            "Close Details Panel",
+                                            &Cancel,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
+                                })
                                 .icon_size(IconSize::Small)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.selected_entry_idx = None;
@@ -3369,6 +3485,11 @@ impl GitGraph {
                                             "view-on-provider",
                                             format!("View on {}", provider_name),
                                         )
+                                        .tooltip({
+                                            move |_window, cx: &mut App| {
+                                                Tooltip::simple("Open In Browser", cx)
+                                            }
+                                        })
                                         .start_icon(
                                             Icon::new(icon)
                                                 .size(IconSize::Small)
@@ -3561,12 +3682,7 @@ impl GitGraph {
         let first_visible_row = (scroll_offset_y / row_height).floor() as usize;
         let vertical_scroll_offset = scroll_offset_y - (first_visible_row as f32 * row_height);
 
-        // The graph column is split into a fixed-width ref-label gutter and the
-        // canvas; the canvas only occupies the space to the right of the gutter.
-        let canvas_viewport_width = (self.graph_viewport_width(window, cx)
-            - self.ref_label_gutter_width(window, cx))
-        .max(px(0.));
-        let graph_width = self.graph_canvas_content_width().max(canvas_viewport_width);
+        let graph_content_width = self.graph_canvas_content_width();
         let last_visible_row = first_visible_row + visible_row_count + 1;
 
         let viewport_range = first_visible_row.min(loaded_commit_count.saturating_sub(1))
@@ -3846,7 +3962,8 @@ impl GitGraph {
                 })
             },
         )
-        .w(graph_width)
+        .w_full()
+        .min_w(graph_content_width)
         .h_full()
     }
 
@@ -3860,7 +3977,6 @@ impl GitGraph {
         cx: &mut Context<GitGraph>,
     ) -> impl IntoElement {
         let row_height = Self::row_height(window, cx);
-        let gutter_width = self.ref_label_gutter_width(window, cx);
         let visible_row_count = self.visible_row_count(window, cx);
         let table_state = self.table_interaction_state.read(cx);
         let viewport_height = table_state
@@ -3884,7 +4000,6 @@ impl GitGraph {
 
         let head_branch_name: Option<SharedString> = self.get_repository(cx).and_then(|repo| {
             repo.read(cx)
-                .snapshot()
                 .branch
                 .as_ref()
                 .map(|branch| SharedString::from(branch.name().to_string()))
@@ -3931,7 +4046,7 @@ impl GitGraph {
                     .absolute()
                     .top(top)
                     .left_0()
-                    .w(gutter_width)
+                    .w_full()
                     .h(row_height)
                     .bg(bg_color)
                     .into_any_element(),
@@ -3988,7 +4103,7 @@ impl GitGraph {
                     .absolute()
                     .top(top)
                     .left_0()
-                    .w(gutter_width)
+                    .w_full()
                     .h(row_height)
                     .child(
                         h_flex()
@@ -4263,13 +4378,21 @@ impl GitGraph {
                     .w_full()
                     .gap_1()
                     .child(
-                        Disclosure::new("toggle-commit-message", !collapsed).on_click(cx.listener(
-                            |this, _, _, cx| {
+                        Disclosure::new("toggle-commit-message", !collapsed)
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.commit_details_message_collapsed =
                                     !this.commit_details_message_collapsed;
                                 cx.notify();
-                            },
-                        )),
+                            }))
+                            .tooltip({
+                                let label = if !collapsed {
+                                    "Hide Commit Message"
+                                } else {
+                                    "Show Commit Message"
+                                };
+
+                                move |_window, cx: &mut App| Tooltip::simple(label, cx)
+                            }),
                     )
                     .child(
                         Label::new("Message")
@@ -4608,6 +4731,7 @@ impl Render for GitGraph {
                                                                         .relative()
                                                                         .h_full()
                                                                         .w(gutter_width)
+                                                                        .max_w(relative(0.5))
                                                                         .flex_shrink_0()
                                                                         .overflow_hidden()
                                                                         .child(
@@ -5061,6 +5185,7 @@ mod persistence {
     pub const LOG_SOURCE_BRANCH: i32 = 1;
     pub const LOG_SOURCE_SHA: i32 = 2;
     pub const LOG_SOURCE_PATH: i32 = 3;
+    pub const LOG_SOURCE_BRANCHES: i32 = 4;
 
     pub const LOG_ORDER_DATE: i32 = 0;
     pub const LOG_ORDER_TOPO: i32 = 1;
@@ -5071,6 +5196,7 @@ mod persistence {
         match log_source {
             LogSource::All => LOG_SOURCE_ALL,
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
+            LogSource::Branches(_) => LOG_SOURCE_BRANCHES,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
         }
@@ -5080,6 +5206,7 @@ mod persistence {
         match log_source {
             LogSource::All => None,
             LogSource::Branch(branch) => Some(branch.to_string()),
+            LogSource::Branches(branches) => serde_json::to_string(branches).ok(),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
         }
@@ -5101,6 +5228,13 @@ mod persistence {
                 .log_source_value
                 .as_ref()
                 .map(|v| LogSource::Branch(v.clone().into()))
+                .unwrap_or_default(),
+            Some(LOG_SOURCE_BRANCHES) => state
+                .log_source_value
+                .as_ref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .filter(|branches: &Vec<gpui::SharedString>| !branches.is_empty())
+                .map(LogSource::Branches)
                 .unwrap_or_default(),
             Some(LOG_SOURCE_SHA) => state
                 .log_source_value
@@ -5386,6 +5520,21 @@ mod tests {
             .enumerate()
             .map(|(idx, entry)| (entry.data.sha, idx))
             .collect()
+    }
+
+    #[test]
+    fn test_toggle_branch_filter_removes_short_branch_ref() {
+        let branch = git::repository::Branch {
+            is_head: true,
+            ref_name: "refs/heads/main".into(),
+            upstream: None,
+            most_recent_commit: None,
+        };
+
+        assert_eq!(
+            toggled_branch_filter_source(&LogSource::Branch("main".into()), &branch),
+            LogSource::All
+        );
     }
 
     fn verify_commit_order(
@@ -6607,6 +6756,29 @@ mod tests {
             LogSource::Branch("refs/heads/main".into())
         );
 
+        let branches = vec!["refs/heads/main".into(), "refs/heads/feature".into()];
+        let branches_state = SerializedGitGraphState {
+            log_source_type: Some(persistence::LOG_SOURCE_BRANCHES),
+            log_source_value: persistence::serialize_log_source_value(&LogSource::Branches(
+                branches.clone(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            persistence::deserialize_log_source(&branches_state),
+            LogSource::Branches(branches)
+        );
+
+        let empty_branches_state = SerializedGitGraphState {
+            log_source_type: Some(persistence::LOG_SOURCE_BRANCHES),
+            log_source_value: Some("[]".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            persistence::deserialize_log_source(&empty_branches_state),
+            LogSource::All
+        );
+
         let sha_state = SerializedGitGraphState {
             log_source_type: Some(persistence::LOG_SOURCE_SHA),
             log_source_value: Some(sha.to_string()),
@@ -7394,6 +7566,94 @@ mod tests {
                 computed_row_height, measured_item_height,
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_graph_canvas_resizes_with_detail_panel_in_same_frame(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let commits = generate_random_commit_dag(&mut rng, 20, false);
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let draw_and_measure = |cx: &mut gpui::VisualTestContext| {
+            cx.draw(
+                point(px(0.), px(0.)),
+                gpui::size(px(1200.), px(800.)),
+                |_, _| git_graph.clone().into_any_element(),
+            );
+            git_graph.read_with(&*cx, |graph, _| {
+                graph
+                    .graph_canvas_bounds
+                    .get()
+                    .expect("graph canvas should have been painted")
+                    .size
+                    .width
+            })
+        };
+
+        // Two frames so the column state has settled before measuring.
+        draw_and_measure(cx);
+        let width_without_panel = draw_and_measure(cx);
+
+        git_graph.update(cx, |graph, cx| {
+            graph.select_entry(0, ScrollStrategy::Nearest, cx);
+        });
+        cx.run_until_parked();
+        let width_with_panel = draw_and_measure(cx);
+        assert!(
+            width_with_panel < width_without_panel,
+            "opening the detail panel should shrink the graph canvas in the same frame \
+             (without panel: {width_without_panel:?}, with panel: {width_with_panel:?})"
+        );
+        assert_eq!(width_with_panel, draw_and_measure(cx));
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.cancel(&Cancel, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            draw_and_measure(cx),
+            width_without_panel,
+            "closing the detail panel should restore the graph canvas width in the same frame"
+        );
     }
 
     #[gpui::test]
